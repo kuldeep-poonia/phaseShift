@@ -345,6 +345,7 @@ function renderTable(svcs){
       '<td>'+f2(svc.cascade_score)+'</td>'+
       '<td>'+pct(svc.upstream_pressure)+'</td>'+
       '<td class="'+(svc.hazard>0.1?'tw':'ts')+'">'+f3(svc.hazard)+'</td>'+
+      '<td>'+ctrlCell(svc.control)+'</td>'+
       '<td class="'+(svc.signal_quality==='sparse'?'tw':'')+'">'+(svc.signal_quality||'—')+
       (svc.spike_detected?' \u26a1':'')+
       (svc.change_point?' \u26a0':'')+
