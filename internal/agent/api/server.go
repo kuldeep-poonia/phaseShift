@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/qphysics/phaseshift/internal/agent/control"
 	"github.com/qphysics/phaseshift/internal/agent/simulation"
     "github.com/qphysics/phaseshift/modelling"
     "github.com/qphysics/phaseshift/telemetry"
@@ -35,6 +36,7 @@ type SystemState struct {
 	SystemFragility      float64       `json:"system_fragility"`
 	NetworkSatRisk       float64       `json:"network_sat_risk"`
 	IsConverging         bool          `json:"is_converging"`
+	ControlPlane         control.Snapshot `json:"control_plane"`
 	Services             []ServiceState `json:"services"`
 	Edges                []EdgeState   `json:"edges"`
 	DiscoveryStatus      string        `json:"discovery_status"`
@@ -68,6 +70,7 @@ type ServiceState struct {
 	SignalQuality        string  `json:"signal_quality"`
 	Hazard               float64 `json:"hazard"`
 	Reservoir            float64 `json:"reservoir"`
+	Control              *control.ServiceSnapshot `json:"control,omitempty"`
 }
 
 type EdgeState struct {
@@ -93,6 +96,7 @@ type Server struct {
 	qEngine   *modelling.QueuePhysicsEngine
 	sigProc   *modelling.SignalProcessor
 	coupler   *modelling.TelemetryCoupler
+	controlPlane *control.Plane
 	tickCount int64
 }
 
@@ -116,6 +120,12 @@ func New(
 	}
 }
 
+func (s *Server) AttachControlPlane(controlPlane *control.Plane) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.controlPlane = controlPlane
+}
+
 func (s *Server) UpdateState(discoveryStatus string, hasLiveData bool) {
 	state := s.computeState(discoveryStatus, hasLiveData)
 	s.mu.Lock()
@@ -134,6 +144,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleDashboard)
 	mux.HandleFunc("/api/state", s.handleState)
+	mux.HandleFunc("/api/control", s.handleControl)
 	mux.HandleFunc("/api/simulate", s.handleSimulate)
 	mux.HandleFunc("/api/services", s.handleServices)
 	mux.HandleFunc("/health", s.handleHealth)
