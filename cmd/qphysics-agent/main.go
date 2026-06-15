@@ -24,6 +24,7 @@ import (
 
 	
     "github.com/qphysics/phaseshift/internal/agent/api"
+    "github.com/qphysics/phaseshift/internal/agent/control"
     "github.com/qphysics/phaseshift/internal/agent/discovery"
     "github.com/qphysics/phaseshift/internal/agent/ingestion"
     "github.com/qphysics/phaseshift/modelling"
@@ -63,9 +64,11 @@ func main() {
 	qEngine := modelling.NewQueuePhysicsEngine()
 	sigProc := modelling.NewSignalProcessor(0.3, 0.05, 3.0)
 	coupler := modelling.NewTelemetryCoupler()
+	controlPlane := control.NewPlane(tickInterval)
 
 	// ── API server ────────────────────────────────────────────────────────
 	srv := api.New(*port, store, graph, qEngine, sigProc, coupler)
+	srv.AttachControlPlane(controlPlane)
 
 	// ── Discovery ─────────────────────────────────────────────────────────
 	discCtx, discCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -89,7 +92,7 @@ func main() {
 	go runTopologyMaintainer(ctx, store, graph, qEngine, sigProc, tickInterval*10)
 
 	// ── Orchestrator tick loop ────────────────────────────────────────────
-	go runOrchestrator(ctx, store, graph, srv, env, tickInterval)
+	go runOrchestrator(ctx, store, graph, srv, env, controlPlane, tickInterval)
 
 	// ── HTTP server (blocks) ──────────────────────────────────────────────
 	if err := srv.Start(ctx); err != nil {
@@ -107,18 +110,19 @@ func runOrchestrator(
 	graph    *topology.Graph,
 	srv      *api.Server,
 	env      *discovery.Environment,
+	controlPlane *control.Plane,
 	interval time.Duration,
 ) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	// First tick immediately.
-	doTick(store, graph, srv, env)
+	doTick(store, graph, srv, env, controlPlane)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			doTick(store, graph, srv, env)
+			doTick(store, graph, srv, env, controlPlane)
 		}
 	}
 }
@@ -128,6 +132,7 @@ func doTick(
 	graph *topology.Graph,
 	srv   *api.Server,
 	env   *discovery.Environment,
+	controlPlane *control.Plane,
 ) {
 	hasData := store.HasServices()
 	if hasData {
@@ -135,10 +140,18 @@ func doTick(
 		windows := store.AllWindows(60, 30*time.Second)
 		if len(windows) > 0 {
 			graph.Update(windows)
+			snap := graph.Snapshot()
 			// Wire FinalFluidPlant outputs (Hazard Z, Reservoir R) into windows.
-			updateFluidStates(windows, graph.Snapshot())
+			updateFluidStates(windows, snap)
+			if controlPlane != nil {
+				controlPlane.Tick(windows, snap, store.SetAppliedScale)
+			}
+		} else if controlPlane != nil {
+			controlPlane.PruneActive(nil)
 		}
 		store.Prune(time.Now())
+	} else if controlPlane != nil {
+		controlPlane.PruneActive(nil)
 	}
 	srv.UpdateState(env.Summary(), hasData)
 }

@@ -187,7 +187,7 @@ const dashHTML = `
         <th>Service</th><th>State</th><th>Utilisation</th><th>Eq &#961;</th>
         <th>Queue</th><th>Sat Horizon</th><th>Collapse Risk</th>
         <th>Burst Amp</th><th>Cascade</th><th>Upstream P</th>
-        <th>Hazard Z</th><th>Signal</th>
+        <th>Hazard Z</th><th>Control</th><th>Signal</th>
       </tr>
     </thead>
     <tbody id="tb"></tbody>
@@ -609,4 +609,3 @@ function satCls(sec){
 </script>
 </body>
 </html>`
-

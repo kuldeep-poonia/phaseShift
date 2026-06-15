@@ -184,6 +184,12 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(s.GetState().Services)
 }
 
+func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	json.NewEncoder(w).Encode(s.controlSnapshot())
+}
+
 func (s *Server) handleSimulate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -213,6 +219,19 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"status":"ok","tick":%d}`, s.tickCount)
 }
 
+func (s *Server) controlSnapshot() control.Snapshot {
+	s.mu.RLock()
+	controlPlane := s.controlPlane
+	s.mu.RUnlock()
+	if controlPlane == nil {
+		return control.Snapshot{
+			Enabled:  false,
+			Services: map[string]control.ServiceSnapshot{},
+		}
+	}
+	return controlPlane.Snapshot()
+}
+
 
 // State computation — full prediction pipeline
 
@@ -223,6 +242,8 @@ func (s *Server) computeState(discoveryStatus string, hasLiveData bool) *SystemS
 		DiscoveryStatus: discoveryStatus,
 		HasLiveData:     hasLiveData,
 	}
+	controlState := s.controlSnapshot()
+	state.ControlPlane = controlState
 
 	snap := s.graph.Snapshot()
 	windows := s.store.AllWindows(60, 30*time.Second)
@@ -303,6 +324,10 @@ func (s *Server) computeState(discoveryStatus string, hasLiveData bool) *SystemS
 				ss.SaturationHorizonSec = qm.SaturationHorizon.Seconds()
 			} else {
 				ss.SaturationHorizonSec = -1
+			}
+			if controlSvc, ok := controlState.Services[svcID]; ok {
+				controlCopy := controlSvc
+				ss.Control = &controlCopy
 			}
 
 			resultMu.Lock()
