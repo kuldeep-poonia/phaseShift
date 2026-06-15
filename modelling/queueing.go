@@ -98,8 +98,10 @@ func (pe *QueuePhysicsEngine) RunQueueModel(w *telemetry.ServiceWindow, topoSnap
 	// Lock released — all computation below is lock-free.
 
 	dt := time.Since(st.lastTickTime).Seconds()
-	if dt <= 0 || dt > 10.0 {
-		dt = 2.0 // default tick clamp
+	if dt < 0.5 || dt > 10.0 {
+		// Sub-500ms: rapid successive calls (warm-up, tests, or same-tick re-reads).
+		// Use default tick interval. Production orchestrator always runs at ≥ 2s.
+		dt = 2.0
 	}
 	st.lastTickTime = time.Now()
 
@@ -107,6 +109,18 @@ func (pe *QueuePhysicsEngine) RunQueueModel(w *telemetry.ServiceWindow, topoSnap
 		ServiceID:  w.ServiceID,
 		ComputedAt: time.Now(),
 		Confidence: confidenceFromSamples(w.SampleCount),
+	}
+	// Guard: sanitize inputs. The store.sanitizePoint handles this for Prometheus-ingested
+	// windows, but windows constructed directly (OTel edge consumer, what-if simulator)
+	// can carry NaN/Inf. One NaN here would corrupt all downstream calculations.
+	if math.IsNaN(w.MeanRequestRate) || math.IsInf(w.MeanRequestRate, 0) {
+		w.MeanRequestRate = 0
+	}
+	if math.IsNaN(w.MeanLatencyMs) || math.IsInf(w.MeanLatencyMs, 0) || w.MeanLatencyMs < 0 {
+		w.MeanLatencyMs = 0
+	}
+	if math.IsNaN(w.MeanActiveConns) || math.IsInf(w.MeanActiveConns, 0) {
+		w.MeanActiveConns = 1
 	}
 	if w.MeanRequestRate <= 0 || w.MeanLatencyMs <= 0 {
 		return m
@@ -119,7 +133,15 @@ func (pe *QueuePhysicsEngine) RunQueueModel(w *telemetry.ServiceWindow, topoSnap
 	c := math.Max(math.Round(w.MeanActiveConns), 1.0)
 	m.Concurrency = c
 
-	currentArrival := w.MeanRequestRate
+	// medianMode=true: use medianBiasedRate for burst-resistant arrival estimation.
+	// This Winsorises the last sample toward the mean when it deviates > 1.5σ,
+	// preventing a single traffic spike from dominating the arrival estimate.
+	var currentArrival float64
+	if medianMode {
+		currentArrival = medianBiasedRate(w.LastRequestRate, w.MeanRequestRate, w.StdRequestRate)
+	} else {
+		currentArrival = w.MeanRequestRate
+	}
 	if currentArrival > st.arrivalMomentum {
 		st.arrivalMomentum = 0.8*currentArrival + 0.2*st.arrivalMomentum
 	} else {
@@ -140,11 +162,16 @@ func (pe *QueuePhysicsEngine) RunQueueModel(w *telemetry.ServiceWindow, topoSnap
 	baselineServicePerServer := 700.0
 	latencyServicePerServer := (1000.0 / math.Max(effectiveLatency, 1e-3)) * hazardFactor
 
+	// Previously: hazardWeight=0 at hazard=0, so latency was completely ignored.
+	// Fix: always blend latency into service rate (minimum 40% weight),
+	// scaled further by hazard. This means latency changes are always visible.
 	hazardWeight := math.Min(w.Hazard, 1.0)
 	if hazardWeight > 0.5 {
 		hazardWeight = 0.5 + (hazardWeight-0.5)*0.2
 	}
-	serviceRatePerServer := hazardWeight*latencyServicePerServer + (1.0-hazardWeight)*baselineServicePerServer
+	// Minimum latency blend: 0.4 at hazard=0, increases to 1.0 at high hazard.
+	latencyBlend := 0.4 + 0.6*hazardWeight
+	serviceRatePerServer := latencyBlend*latencyServicePerServer + (1.0-latencyBlend)*baselineServicePerServer
 
 	appliedScale := 1.0
 	if w.AppliedScale > 0 {
@@ -156,29 +183,42 @@ func (pe *QueuePhysicsEngine) RunQueueModel(w *telemetry.ServiceWindow, topoSnap
 
 	netFlowNormalised := (m.ArrivalRate - m.ServiceRate) / c
 	st.accumulatedBacklog += netFlowNormalised * c * dt
-	if st.accumulatedBacklog < 0 {
-		st.accumulatedBacklog = 0.0
-	}
-	m.MeanQueueLen = st.accumulatedBacklog
+	st.accumulatedBacklog = pos(st.accumulatedBacklog)
+	// MeanQueueLen is now set in the utilisation block below:
+	// - rho >= 1: physical accumulated backlog
+	// - rho <  1: Erlang-C / Little's Law formula
 
 	m.Utilisation = m.ArrivalRate / math.Max(m.ServiceRate, 1e-3)
 	if m.Utilisation > 1.0 && m.ServiceRate > 0 {
+		// Overload: use accumulated physical backlog (grows with time).
+		m.MeanQueueLen = st.accumulatedBacklog
 		m.MeanWaitMs = (m.MeanQueueLen / m.ServiceRate) * 1000.0
 	} else {
+		// Sub-saturation: use M/M/c Erlang-C queue length formula.
+		// E[Lq] = C(c,a) * rho / (c*(1-rho))
+		// where a = arrival/serviceRatePerServer, rho = a/c
+		// Previously MeanQueueLen was always 0 below saturation — wrong.
 		a := m.ArrivalRate / serviceRatePerServer
 		erlangC := computeErlangC(c, a)
 		denom := c * serviceRatePerServer * (1.0 - m.Utilisation)
-		if denom > 0 {
-			m.MeanWaitMs = (erlangC / denom) * 1000.0
-		} else {
-			m.MeanWaitMs = 0
-		}
+		m.MeanWaitMs = safeDiv(erlangC, denom, 0) * 1000.0
+		// E[Lq] = λ × E[Wq] / c  — corrected M/M/c Little's Law.
+		// Without /c this is factor-of-c too large for multi-server queues.
+		// Derivation: E[Lq] = C(c,a) × ρ / (c × (1-ρ))
+		//             E[Wq] = C(c,a) / (c × μ × (1-ρ))
+		//             E[Lq] = λ × E[Wq] = ρ × c × μ × E[Wq] / c = ρ × μ × E[Wq]
+		// Since μ = svcRatePerServer and arrival = ρ × c × μ:
+		//   arrival × E[Wq] / c = ρ × μ × E[Wq] = ρ × C(c,a)/(c×μ×(1-ρ)) × μ = correct
+		m.MeanQueueLen = m.ArrivalRate * safeDiv(m.MeanWaitMs, 1000.0, 0) / m.Concurrency
 	}
 	m.AdjustedWaitMs = m.MeanWaitMs
 	m.MeanSojournMs = m.MeanWaitMs + effectiveLatency
-	m.BurstFactor = 1.0
+	// BurstFactor from M/G/1: (1 + CoV²) / 2 using service time CoV from P99/mean ratio.
+	// Previously hardcoded to 1.0 (M/M/1 assumption). Now uses actual latency distribution.
+	serviceCoV := estimateServiceCoV(w)
+	m.BurstFactor = (1.0 + serviceCoV*serviceCoV) / 2.0
 
-	rawTrend := utilTrendRegression(w, m.ServiceRate)
+	rawTrend := utilTrendRegression(w, m.ServiceRate, dt)
 	m.UtilisationTrend = rawTrend * trustWeight
 
 	if m.Utilisation < 1.0 && m.UtilisationTrend > 1e-6 {
@@ -198,7 +238,6 @@ func (pe *QueuePhysicsEngine) RunQueueModel(w *telemetry.ServiceWindow, topoSnap
 
 	_ = trustWeight // used above
 	_ = topoSnap    // kept for interface compatibility; upstream pressure already in window
-	_ = medianMode  // arrival blend applied upstream
 
 	return m
 }
@@ -273,17 +312,26 @@ func estimateServiceCoV(w *telemetry.ServiceWindow) float64 {
 	return math.Min(cov, 5.0)
 }
 
-func utilTrendRegression(w *telemetry.ServiceWindow, serviceRate float64) float64 {
+// utilTrendRegression computes utilisation trend in ρ/second.
+//
+// Previous bug: slope was divided by halfWindowSec = SampleCount (60s),
+// but (lastUtil - meanUtil) represents change over ONE tick interval (dt),
+// not over the entire window. This caused 30-60× overestimate of time-to-saturation.
+//
+// Fix: divide by dt (actual elapsed seconds this tick). The trend is:
+//   slope = (lastUtil - meanUtil) / dt   [ρ per second]
+// Then SaturationHorizon = (1 - currentRho) / slope  [seconds to ρ=1]
+func utilTrendRegression(w *telemetry.ServiceWindow, serviceRate, dt float64) float64 {
 	if w.SampleCount < 3 || serviceRate <= 0 {
 		return 0
 	}
-	halfWindowSec := float64(w.SampleCount) * 2.0 / 2.0
-	if halfWindowSec <= 0 {
-		return 0
+	if dt <= 0 {
+		dt = 2.0
 	}
 	lastUtil := w.LastRequestRate / serviceRate
 	meanUtil := w.MeanRequestRate / serviceRate
-	slope := (lastUtil - meanUtil) / halfWindowSec
+	// slope = change in ρ per second (lastRate is most recent, meanRate is window average)
+	slope := (lastUtil - meanUtil) / dt
 	conf := confidenceFromSamples(w.SampleCount)
 	slope *= conf
 	return math.Max(-0.5, math.Min(slope, 0.5))
@@ -297,12 +345,12 @@ func stalePenalty(w *telemetry.ServiceWindow, tickInterval float64) float64 {
 	if ageSec <= 0 {
 		return 1.0
 	}
-	return math.Exp(-ageSec / (3.0 * tickInterval))
+	return clamp01(math.Exp(-ageSec / (3.0 * tickInterval)))
 }
 
 func confidenceFromSamples(n int) float64 {
 	if n <= 0 {
 		return 0
 	}
-	return 1.0 - math.Exp(-float64(n)/15.0)
+	return clamp01(1.0 - math.Exp(-float64(n)/15.0))
 }

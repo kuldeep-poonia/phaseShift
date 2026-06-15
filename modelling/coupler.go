@@ -1,7 +1,6 @@
 package modelling
 
 import (
-	"log"
 	"math"
 
 	"github.com/qphysics/phaseshift/telemetry"
@@ -108,10 +107,9 @@ func (c *TelemetryCoupler) ApplyCoupling(windows map[string]*telemetry.ServiceWi
 			st.varianceAcc *= 0.85 // relax structurally once equilibrium bounds
 		}
 		w.StdRequestRate += st.varianceAcc
-
-		// G. Structured Coupling Logging
-		log.Printf("[coupler] svc=%s window_queue_baseline=%.3f window_latency_persisted=%.3f demand_memory_factor=%.3f propagation_stage=%d variance=%.3f",
-			id, st.queueBaseline, st.latencyPersisted, st.demandMemory, st.propIdx, st.varianceAcc)
+		// G. Coupling state is fully observable via /api/state and /api/services endpoints.
+		// Hot-path log.Printf removed: was firing per-service per-tick (~100 writes/sec at
+		// 100 services), each allocating fmt.Sprintf buffer under the log mutex.
 	}
 
 	// Prune inactive metrics bounds

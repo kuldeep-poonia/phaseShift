@@ -145,60 +145,92 @@ func reachCount(start string, adj map[string][]string, maxDepth int) int {
 // findMaxAmplificationPath finds the path with the highest sum of log(weights),
 // equivalent to the maximum weight-product path.
 // Returns (amplification_score, path_nodes).
+// findMaxAmplificationPath finds the path through the service graph with the
+// highest cumulative edge-weight product (maximum traffic amplification potential).
+//
+// Previous approach (Bellman-Ford on log-weights) had a fundamental flaw:
+// since all edge weights ≤ 1.0, log(weight) ≤ 0, and longer paths always have
+// a smaller (more negative) sum of log-weights than shorter paths. Bellman-Ford
+// maximising this sum always preferred single-edge paths over multi-hop chains.
+//
+// Correct approach: DFS from each source node, tracking accumulated weight
+// product. The path with the highest product is returned. For graphs up to
+// 300 nodes (our cap) with bounded depth, this is efficient enough.
 func findMaxAmplificationPath(snap topology.GraphSnapshot) (float64, []string) {
 	if len(snap.Edges) == 0 {
 		return 0, nil
 	}
 
-	// Build log-weight adjacency.
+	// Build direct-weight adjacency (no log transform).
 	type edge struct {
 		target string
-		logW   float64
+		weight float64
 	}
 	adj := make(map[string][]edge, len(snap.Nodes))
+	hasIncoming := make(map[string]bool, len(snap.Nodes))
 	for _, e := range snap.Edges {
 		if e.Weight > 0 {
-			adj[e.Source] = append(adj[e.Source], edge{e.Target, math.Log(e.Weight)})
+			adj[e.Source] = append(adj[e.Source], edge{e.Target, e.Weight})
+			hasIncoming[e.Target] = true
 		}
 	}
 
-	// Bellman-Ford longest path (negate weights for max).
-	dist := make(map[string]float64, len(snap.Nodes))
-	prev := make(map[string]string, len(snap.Nodes))
+	// Source nodes: no incoming edges → valid starting points.
+	var sources []string
+	for _, n := range snap.Nodes {
+		if !hasIncoming[n.ServiceID] {
+			sources = append(sources, n.ServiceID)
+		}
+	}
+	// If every node has incoming edges (cycle) treat all as potential sources.
+	if len(sources) == 0 {
+		for _, n := range snap.Nodes {
+			sources = append(sources, n.ServiceID)
+		}
+	}
 
-	for iter := 0; iter < len(snap.Nodes); iter++ {
-		for src, edges := range adj {
-			for _, e := range edges {
-				if dist[src]+e.logW > dist[e.target] {
-					dist[e.target] = dist[src] + e.logW
-					prev[e.target] = src
-				}
+	bestScore := 0.0
+	var bestPath []string
+
+	// DFS with visited set to avoid cycles.
+	var dfs func(node string, product float64, path []string, visited map[string]bool)
+	dfs = func(node string, product float64, path []string, visited map[string]bool) {
+		path = append(path, node)
+		// Score = product × path length. Longer paths that maintain high weight
+		// are more dangerous than single high-weight edges.
+		score := product * float64(len(path))
+		if score > bestScore {
+			bestScore = score
+			bestPath = make([]string, len(path))
+			copy(bestPath, path)
+		}
+		for _, e := range adj[node] {
+			if !visited[e.target] {
+				visited[e.target] = true
+				dfs(e.target, product*e.weight, path, visited)
+				visited[e.target] = false
 			}
 		}
 	}
 
-	// Find endpoint of best path.
-	bestEnd := ""
-	bestDist := -math.MaxFloat64
-	for id, d := range dist {
-		if d > bestDist {
-			bestDist = d
-			bestEnd = id
-		}
+	for _, src := range sources {
+		visited := map[string]bool{src: true}
+		dfs(src, 1.0, nil, visited)
 	}
-	if bestEnd == "" {
+
+	if len(bestPath) == 0 {
 		return 0, nil
 	}
-
-	// Reconstruct path.
-	var path []string
-	cur := bestEnd
-	visited := make(map[string]bool)
-	for cur != "" && !visited[cur] {
-		path = append([]string{cur}, path...)
-		visited[cur] = true
-		cur = prev[cur]
+	// Return the weight product (without the length multiplier) as the score.
+	// Recompute pure product for the best path.
+	pureProduct := 1.0
+	for i := 0; i < len(bestPath)-1; i++ {
+		for _, e := range adj[bestPath[i]] {
+			if e.target == bestPath[i+1] {
+				pureProduct *= e.weight
+				break
+			}
+		}
 	}
-
-	return math.Exp(bestDist), path
+	return pureProduct, bestPath
 }
